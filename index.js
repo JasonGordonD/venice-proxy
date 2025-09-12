@@ -17,6 +17,13 @@ app.post("/chat/completions", async (req, res) => {
 
   const body = { ...req.body, stream: false };
 
+  // ✅ Inject model if it's missing (required by Venice)
+  if (!body.model) {
+    console.log("⚠️ No model found — injecting default model: venice-uncensored");
+    body.model = "venice-uncensored";
+  }
+
+  // Remove unsupported stream options
   if (body.stream_options) {
     console.log("❌ Stripping stream_options");
     delete body.stream_options;
