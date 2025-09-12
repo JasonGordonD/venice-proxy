@@ -16,16 +16,24 @@ type JsonRpcRequest = {
   params?: unknown;
   id?: string | number | null;
 };
-
 type ChatMessage = { role: 'system' | 'user' | 'assistant' | 'tool'; content: unknown };
 type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean };
 
 app.post("/chat/completions", async (req: Request, res: Response, _next: NextFunction) => {
   const body = req.body;
 
+  // ✅ Restrict access to ElevenLabs only
+  const clientHeader = req.headers['x-client'];
+  if (clientHeader !== 'elevenlabs') {
+    console.warn('🚫 Unauthorized client attempted access:', clientHeader);
+    return res.status(403).json({ error: 'Access denied. Unauthorized client.' });
+  }
+
   // ✅ Step 1: Block MCP (JSON-RPC) requests
   if (isJsonRpc(body)) {
     console.log('🛑 JSON-RPC (MCP) request received — rejecting');
+    console.log('📦 Rejected Payload:', JSON.stringify(body, null, 2));
+    console.log('📡 Headers:', JSON.stringify(req.headers, null, 2));
     return res.status(400).json({
       error: "JSON-RPC (MCP) request cannot be sent to chat endpoint. Route it to an MCP handler."
     });
@@ -84,7 +92,6 @@ function maybeInjectDefaultModel(b: any) {
     console.warn(`⚠️ No model found — injecting default model: ${DEFAULT_MODEL}`);
     b.model = DEFAULT_MODEL;
   }
-
   if (typeof b.stream === 'undefined') {
     b.stream = false;
   }
