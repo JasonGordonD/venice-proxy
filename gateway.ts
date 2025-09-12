@@ -50,24 +50,34 @@ app.post("/chat/completions", async (req: Request, res: Response, _next: NextFun
   maybeInjectDefaultModel(body);
 
   // ✅ Step 4: Forward to Venice
-  console.log("📤 Sending modified request to Venice:", {
-    model: body.model,
-    stream: body.stream
-  });
+  const isStreaming = body.stream === true;
+  console.log(isStreaming
+    ? "📤 (stream) Sending request to Venice:"
+    : "📤 Sending modified request to Venice:",
+  { model: body.model, stream: body.stream });
 
   try {
-    const response = await fetch(VENICE_CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.VENICE_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
-    });
+    if (isStreaming) {
+      return streamFromVenice(body, req, res);
+    } else {
+      const response = await fetch(VENICE_CHAT_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.VENICE_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
 
-    const data = await response.json();
+      if (!response.ok) {
+        const text = await safeReadText(response);
+        console.error('⬆️ Upstream non-OK (JSON path):', response.status, text);
+        return res.status(response.status).json(mapUpstreamErrorToChatMessage({ message: text, status: response.status }));
+      }
 
-    return res.status(response.status).json(data);
+      const data = await response.json();
+      return res.status(response.status).json(data);
+    }
   } catch (err) {
     console.error("❌ Proxy error:", err);
     return res.status(502).json(mapUpstreamErrorToChatMessage(err));
@@ -118,6 +128,82 @@ function mapUpstreamErrorToChatMessage(err: unknown) {
       },
     ],
   };
+}
+
+async function safeReadText(response: any): Promise<string> {
+  try {
+    return await response.text();
+  } catch {
+    return '';
+  }
+}
+
+/** SSE pass-through for stream=true */
+async function streamFromVenice(body: any, req: Request, res: Response) {
+  const controller = new AbortController();
+  req.on('close', () => {
+    controller.abort();
+  });
+
+  const upstream = await fetch(VENICE_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.VENICE_API_KEY}`,
+      "Content-Type": "application/json",
+      "Accept": "text/event-stream"
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal
+  });
+
+  if (!upstream.ok) {
+    const text = await safeReadText(upstream);
+    console.error('⬆️ Upstream non-OK (stream path):', upstream.status, text);
+    return res.status(upstream.status).json(mapUpstreamErrorToChatMessage({ message: text, status: upstream.status }));
+  }
+
+  // Prepare SSE response to client
+  res.status(200);
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  // @ts-ignore (not in Express types)
+  if (typeof (res as any).flushHeaders === 'function') {
+    (res as any).flushHeaders();
+  }
+
+  // Keep-alive comment (some clients like to see initial bytes)
+  try {
+    res.write(": connected\n\n");
+  } catch {}
+
+  const readable = upstream.body; // Node Readable stream
+  if (!readable) {
+    console.error("❌ Upstream body missing on stream path");
+    res.end();
+    return;
+  }
+
+  readable.on('error', (e: any) => {
+    console.error('❌ Upstream stream error:', e);
+    try {
+      res.write(`event: error\ndata: ${JSON.stringify({ message: 'upstream stream error' })}\n\n`);
+    } catch {}
+    res.end();
+  });
+
+  readable.on('end', () => {
+    try {
+      res.write("event: end\ndata: [DONE]\n\n");
+    } catch {}
+    res.end();
+  });
+
+  // Pipe upstream SSE to client as-is
+  readable.pipe(res);
 }
 
 const PORT = process.env.PORT || 10000;
