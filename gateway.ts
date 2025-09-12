@@ -66,17 +66,16 @@ app.post("/chat/completions", async (req: Request, res: Response, _next: NextFun
   }
 });
 
-/** MCP Detection */
+/** Helpers */
+
 function isJsonRpc(b: any): b is JsonRpcRequest {
   return b && typeof b === 'object' && b.jsonrpc === '2.0' && 'method' in b;
 }
 
-/** Chat Payload Detection */
 function isChatPayload(b: any): b is ChatPayload {
   return b && typeof b === 'object' && Array.isArray(b.messages);
 }
 
-/** Model Injection */
 function maybeInjectDefaultModel(b: any) {
   if (!Array.isArray(b?.messages)) return;
 
@@ -91,7 +90,6 @@ function maybeInjectDefaultModel(b: any) {
   }
 }
 
-/** Error-to-Chat-Response Formatter */
 function mapUpstreamErrorToChatMessage(err: unknown) {
   const msg =
     (err as any)?.issues?.[0]?.message ||
@@ -115,7 +113,6 @@ function mapUpstreamErrorToChatMessage(err: unknown) {
   };
 }
 
-/** Start Server */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);

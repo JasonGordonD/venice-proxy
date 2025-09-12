@@ -1,11 +1,10 @@
 {
   "name": "venice-proxy",
   "version": "1.0.0",
-  "description": "Proxy for forwarding chat requests to Venice and handling MCP separation.",
+  "description": "A TypeScript proxy for forwarding chat requests to Venice with MCP filtering.",
   "main": "gateway.ts",
   "scripts": {
-    "start": "ts-node gateway.ts",
-    "dev": "ts-node-dev --respawn --transpile-only gateway.ts"
+    "start": "ts-node gateway.ts"
   },
   "dependencies": {
     "dotenv": "^17.2.2",
@@ -16,7 +15,6 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.8.0",
     "ts-node": "^10.9.2",
-    "ts-node-dev": "^2.0.0",
     "typescript": "^5.2.2"
   },
   "engines": {
