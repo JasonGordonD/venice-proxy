@@ -4,24 +4,29 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(express.json());
 
-// ✅ Root route to confirm server is alive
+// ✅ Health check route for debugging
 app.get("/", (req, res) => {
   console.log("🌐 GET / called");
   res.send("Proxy is running");
 });
 
-// ✅ Main proxy route for ElevenLabs
+// ✅ Main proxy route for ElevenLabs → Venice
 app.post("/chat/completions", async (req, res) => {
   console.log("📥 Incoming request from client:");
   console.log(JSON.stringify(req.body, null, 2));
 
-  const body = {
-    ...req.body,
-    stream: false // Force disable streaming
-  };
+  // 🛠 Deep clone and modify request body
+  const body = JSON.parse(JSON.stringify(req.body));
+  body.stream = false;
+
+  // 🚫 Remove invalid field for Venice API
+  if (body.stream_options) {
+    console.log("❌ Stripping stream_options (not allowed when stream = false)");
+    delete body.stream_options;
+  }
 
   try {
-    console.log("📤 Sending modified request to Venice...");
+    console.log("📤 Sending modified request to Venice:");
     console.log(JSON.stringify(body, null, 2));
 
     const response = await fetch("https://api.venice.ai/api/v1/chat/completions", {
@@ -41,18 +46,17 @@ app.post("/chat/completions", async (req, res) => {
     try {
       const json = JSON.parse(text);
       res.status(response.status).json(json);
-    } catch (jsonError) {
-      console.error("❌ Failed to parse Venice response as JSON:", jsonError);
+    } catch (parseErr) {
+      console.error("❌ Failed to parse Venice response as JSON:", parseErr);
       res.status(500).json({ error: "Invalid JSON response from Venice" });
     }
-
-  } catch (error) {
-    console.error("❌ Proxy error:", error);
+  } catch (err) {
+    console.error("❌ Proxy error:", err);
     res.status(500).json({ error: "Proxy server error" });
   }
 });
 
-// ✅ Start the server
+// ✅ Start the proxy server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
