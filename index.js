@@ -15,8 +15,7 @@ app.post("/chat/completions", async (req, res) => {
   console.log("📥 Incoming request from client:");
   console.log(JSON.stringify(req.body, null, 2));
 
-  const body = JSON.parse(JSON.stringify(req.body));
-  body.stream = false;
+  const body = { ...req.body, stream: false };
 
   if (body.stream_options) {
     console.log("❌ Stripping stream_options");
@@ -37,13 +36,13 @@ app.post("/chat/completions", async (req, res) => {
     });
 
     const text = await response.text();
+
     console.log("📬 Received response from Venice:");
     console.log(text);
 
     try {
       const original = JSON.parse(text);
 
-      // ✅ Construct strict OpenAI-compatible response
       const cleaned = {
         id: original.id,
         object: original.object,
@@ -64,9 +63,9 @@ app.post("/chat/completions", async (req, res) => {
       console.log("✅ Cleaned response to ElevenLabs:");
       console.log(JSON.stringify(cleaned, null, 2));
 
-      res.status(response.status).json(cleaned);
+      res.status(200).json(cleaned);
     } catch (parseErr) {
-      console.error("❌ Failed to parse/clean Venice response:", parseErr);
+      console.error("❌ Failed to parse Venice response:", parseErr);
       res.status(500).json({ error: "Invalid JSON from Venice" });
     }
   } catch (err) {
@@ -76,7 +75,7 @@ app.post("/chat/completions", async (req, res) => {
 });
 
 // Start server
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
 });
