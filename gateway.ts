@@ -27,7 +27,7 @@ export async function gateway(req: Request, res: Response, _next: NextFunction) 
     });
   }
 
-  maybeInjectDefaultModel(body); // <-- Patch B will go here
+  maybeInjectDefaultModel(body); // ✅ Only inject if it's a chat payload
 
   console.log('📤 Sending modified request to Venice:', {
     model: body.model,
@@ -42,10 +42,11 @@ export async function gateway(req: Request, res: Response, _next: NextFunction) 
     });
 
     const data = await response.json();
+
     return res.status(response.status).json(data);
   } catch (err) {
     console.error('🧨 Error talking to Venice:', err);
-    return res.status(502).json(mapUpstreamErrorToChatMessage(err));
+    return res.status(502).json(mapUpstreamErrorToChatMessage(err)); // ✅ Improved
   }
 }
 
@@ -59,7 +60,12 @@ function isChatPayload(b: any): b is ChatPayload {
   return b && typeof b === 'object' && Array.isArray(b.messages);
 }
 
-function maybeInjectDefaultModel(b: ChatPayload) {
+// ✅ Updated: only inject model/stream if this is a valid chat payload
+function maybeInjectDefaultModel(b: any) {
+  if (!Array.isArray(b?.messages)) {
+    return; // ❌ Don't inject into non-chat (e.g. MCP)
+  }
+
   const DEFAULT_MODEL = process.env.DEFAULT_CHAT_MODEL || 'venice-uncensored';
   if (!b.model) {
     console.warn(`⚠️ No model found — injecting default model: ${DEFAULT_MODEL}`);
@@ -87,7 +93,14 @@ async function proxyToMcpJsonRpc(body: JsonRpcRequest, req: Request, res: Respon
   return res.status(r.status).json(json);
 }
 
+// ✅ Improved: return error message in assistant.content to avoid blank replies
 function mapUpstreamErrorToChatMessage(err: unknown) {
+  const msg =
+    (err as any)?.issues?.[0]?.message ||
+    (err as any)?.details?._errors?.[0] ||
+    (err as any)?.message ||
+    'Unknown error from upstream';
+
   return {
     error: 'Upstream error',
     details: err,
@@ -96,7 +109,7 @@ function mapUpstreamErrorToChatMessage(err: unknown) {
         index: 0,
         message: {
           role: 'assistant',
-          content: `Error: ${typeof err === 'string' ? err : JSON.stringify(err)}`,
+          content: `Error: ${msg}`,
         },
         finish_reason: 'stop',
       },
