@@ -22,14 +22,14 @@ type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean }
 app.post("/chat/completions", async (req: Request, res: Response, _next: NextFunction) => {
   const body = req.body;
 
-  // Access restriction
+  // Restrict access to ElevenLabs only
   const clientHeader = req.headers['x-client'];
   if (clientHeader !== 'elevenlabs') {
     console.warn('🚫 Unauthorized client attempted access:', clientHeader);
     return res.status(403).json({ error: 'Access denied. Unauthorized client.' });
   }
 
-  // Block MCP/JSON-RPC payloads on this route
+  // Block MCP/JSON-RPC on chat route
   if (isJsonRpc(body)) {
     console.log('🛑 JSON-RPC (MCP) request received — rejecting');
     console.log('📦 Rejected Payload:', JSON.stringify(body, null, 2));
@@ -46,22 +46,21 @@ app.post("/chat/completions", async (req: Request, res: Response, _next: NextFun
     });
   }
 
-  // Defaults
+  // Inject defaults (and ensure streaming is OFF)
   maybeInjectDefaultModel(body);
 
-  const isStreaming = body.stream === true;
-  console.log(
-    isStreaming ? "📤 (stream) Sending request to Venice:" : "📤 Sending modified request to Venice:",
-    { model: body.model, stream: body.stream }
-  );
+  // Hard-disable streaming regardless of client request
+  if (body.stream === true) {
+    console.warn("⚠️ Incoming request requested stream=true — forcing stream=false (streaming disabled)");
+    body.stream = false;
+  }
+
+  console.log("📤 Sending modified request to Venice:", {
+    model: body.model,
+    stream: body.stream
+  });
 
   try {
-    if (isStreaming) {
-      await streamFromVenice(body, req, res);
-      return;
-    }
-
-    // Non-streaming JSON path
     const response = await fetch(VENICE_CHAT_URL, {
       method: "POST",
       headers: {
@@ -71,9 +70,10 @@ app.post("/chat/completions", async (req: Request, res: Response, _next: NextFun
       body: JSON.stringify(body)
     });
 
+    // Non-stream JSON path only
     if (!response.ok) {
       const text = await safeReadText(response);
-      console.error('⬆️ Upstream non-OK (JSON path):', response.status, text);
+      console.error('⬆️ Upstream non-OK:', response.status, text);
       return res
         .status(response.status)
         .json(mapUpstreamErrorToChatMessage({ message: text, status: response.status }));
@@ -82,11 +82,6 @@ app.post("/chat/completions", async (req: Request, res: Response, _next: NextFun
     const data = await response.json();
     return res.status(response.status).json(data);
   } catch (err) {
-    if ((err as any)?.name === 'AbortError' || (err as any)?.type === 'aborted') {
-      console.warn('⛔ Client aborted; upstream fetch aborted safely.');
-      try { if (!res.headersSent) res.end(); } catch {}
-      return;
-    }
     console.error("❌ Proxy error:", err);
     if (!res.headersSent) {
       return res.status(502).json(mapUpstreamErrorToChatMessage(err));
@@ -112,9 +107,8 @@ function maybeInjectDefaultModel(b: any) {
     console.warn(`⚠️ No model found — injecting default model: ${DEFAULT_MODEL}`);
     b.model = DEFAULT_MODEL;
   }
-  if (typeof b.stream === 'undefined') {
-    b.stream = false;
-  }
+  // Force streaming off by default
+  b.stream = false;
 }
 
 function mapUpstreamErrorToChatMessage(err: unknown) {
@@ -139,100 +133,6 @@ function mapUpstreamErrorToChatMessage(err: unknown) {
 
 async function safeReadText(response: any): Promise<string> {
   try { return await response.text(); } catch { return ''; }
-}
-
-/** SSE pass-through with immediate headers + heartbeat + abort-safety */
-async function streamFromVenice(body: any, req: Request, res: Response) {
-  const controller = new AbortController();
-
-  // Send SSE headers immediately so clients see bytes and keep connection open
-  try {
-    res.status(200);
-    res.set({
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no"
-    });
-    // @ts-ignore
-    if (typeof (res as any).flushHeaders === 'function') (res as any).flushHeaders();
-    res.write(": connected\n\n"); // prelude for instant bytes
-  } catch (e) {
-    console.error('❌ Failed setting SSE headers/prelude:', e);
-    return;
-  }
-
-  // Heartbeat every 15s
-  const heartbeat = setInterval(() => {
-    try { res.write(": ping\n\n"); } catch {}
-  }, 15000);
-
-  const cleanup = () => {
-    try { clearInterval(heartbeat); } catch {}
-    try { controller.abort(); } catch {}
-  };
-
-  req.on('close', cleanup);
-  res.on('close', cleanup);
-
-  let upstream: any;
-  try {
-    upstream = await fetch(VENICE_CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.VENICE_API_KEY}`,
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream"
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-  } catch (e: any) {
-    if (e?.name === 'AbortError' || e?.type === 'aborted') {
-      console.warn('⛔ Upstream fetch aborted because client disconnected.');
-      return;
-    }
-    console.error('❌ Upstream fetch error (stream path):', e);
-    try { res.write(`event: error\ndata: ${JSON.stringify({ message: e?.message || 'upstream fetch error' })}\n\n`); } catch {}
-    return;
-  }
-
-  if (!upstream.ok) {
-    const text = await safeReadText(upstream);
-    console.error('⬆️ Upstream non-OK (stream path):', upstream.status, text);
-    try {
-      res.write(`event: error\ndata: ${JSON.stringify({ status: upstream.status, message: text })}\n\n`);
-      res.write("event: end\ndata: [DONE]\n\n");
-      res.end();
-    } catch {}
-    return;
-  }
-
-  const upstreamBody = upstream.body;
-  if (!upstreamBody) {
-    console.error("❌ Upstream body missing on stream path");
-    try { res.write("event: error\ndata: {\"message\":\"no upstream body\"}\n\n"); } catch {}
-    try { res.end(); } catch {}
-    return;
-  }
-
-  upstreamBody.on('error', (e: any) => {
-    console.error('❌ Upstream stream error:', e);
-    try { res.write(`event: error\ndata: ${JSON.stringify({ message: 'upstream stream error' })}\n\n`); } catch {}
-    try { res.end(); } catch {}
-  });
-
-  upstreamBody.on('end', () => {
-    try { res.write("event: end\ndata: [DONE]\n\n"); } catch {}
-    try { res.end(); } catch {}
-    try { clearInterval(heartbeat); } catch {}
-  });
-
-  try { upstreamBody.pipe(res); } catch (e) {
-    console.error('❌ Pipe error:', e);
-    try { clearInterval(heartbeat); } catch {}
-    try { res.end(); } catch {}
-  }
 }
 
 const PORT = process.env.PORT || 10000;
