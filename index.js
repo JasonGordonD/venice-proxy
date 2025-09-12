@@ -4,22 +4,17 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(express.json());
 
-// ✅ Health check route for debugging
 app.get("/", (req, res) => {
   console.log("🌐 GET / called");
   res.send("Proxy is running");
 });
 
-// ✅ Main proxy route for ElevenLabs → Venice
 app.post("/chat/completions", async (req, res) => {
   console.log("📥 Incoming request from client:");
   console.log(JSON.stringify(req.body, null, 2));
 
-  // 🛠 Deep clone and modify request body
   const body = JSON.parse(JSON.stringify(req.body));
   body.stream = false;
-
-  // 🚫 Remove invalid field for Venice API
   if (body.stream_options) {
     console.log("❌ Stripping stream_options (not allowed when stream = false)");
     delete body.stream_options;
@@ -39,15 +34,31 @@ app.post("/chat/completions", async (req, res) => {
     });
 
     const text = await response.text();
-
     console.log("📬 Received response from Venice:");
     console.log(text);
 
     try {
       const json = JSON.parse(text);
+
+      // ✅ Clean Venice's response before sending it to ElevenLabs
+      if (json.choices?.[0]?.message) {
+        const msg = json.choices[0].message;
+        delete msg.refusal;
+        delete msg.annotations;
+        delete msg.audio;
+        delete msg.function_call;
+        delete msg.tool_calls;
+        delete msg.reasoning_content;
+      }
+
+      delete json.venice_parameters;
+
+      console.log("✅ Cleaned response to ElevenLabs:");
+      console.log(JSON.stringify(json, null, 2));
+
       res.status(response.status).json(json);
-    } catch (parseErr) {
-      console.error("❌ Failed to parse Venice response as JSON:", parseErr);
+    } catch (err) {
+      console.error("❌ JSON parse error:", err);
       res.status(500).json({ error: "Invalid JSON response from Venice" });
     }
   } catch (err) {
@@ -56,7 +67,6 @@ app.post("/chat/completions", async (req, res) => {
   }
 });
 
-// ✅ Start the proxy server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Proxy server running on port ${PORT}`);
