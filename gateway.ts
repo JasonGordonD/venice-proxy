@@ -1,3 +1,4 @@
+// gateway.ts (v3)
 require("dotenv").config();
 
 import type { Request, Response, NextFunction } from "express";
@@ -23,8 +24,9 @@ type ChatMessage = {
 };
 type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean };
 
-/**
- * Sanitize request body for Venice API
+/** -----------------------------
+ * Request sanitizer (whitelist)
+ * ------------------------------
  */
 function sanitizeChatBody(b: any) {
   if (!b || typeof b !== "object") return {};
@@ -38,20 +40,60 @@ function sanitizeChatBody(b: any) {
   };
 }
 
-/**
- * Sanitize Venice response into pure OpenAI format
+/** -----------------------------
+ * Response sanitizer (deep)
+ * Return a strict OpenAI-style response
+ * ------------------------------
  */
-function sanitizeResponse(data: any) {
+function sanitizeChoice(choice: any) {
+  const idx = typeof choice.index === "number" ? choice.index : 0;
+  const finish_reason = choice.finish_reason ?? choice.stop_reason ?? "stop";
+
+  // message may be under choice.message or choice.delta for streaming (we expect message)
+  const msg = choice.message ?? choice.delta ?? {};
+  const role = msg.role ?? "assistant";
+  const content =
+    typeof msg.content === "string"
+      ? msg.content
+      : // sometimes content may be an object/array — stringify safely
+        (msg.content ? JSON.stringify(msg.content) : "");
+
   return {
-    id: data.id,
-    object: data.object,
-    created: data.created,
-    model: data.model,
-    choices: data.choices,
-    usage: data.usage,
+    index: idx,
+    message: {
+      role,
+      content,
+    },
+    finish_reason,
   };
 }
 
+function sanitizeResponse(data: any) {
+  // defensive defaults
+  const id = data?.id ?? `chatcmpl-${Date.now()}`;
+  const object = data?.object ?? "chat.completion";
+  const created = data?.created ?? Math.floor(Date.now() / 1000);
+  const model = data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
+  const usage = data?.usage ?? null;
+
+  // ensure choices is an array and deep-clean each choice/message
+  const rawChoices = Array.isArray(data?.choices) ? data.choices : [];
+  const choices = rawChoices.map(sanitizeChoice);
+
+  return {
+    id,
+    object,
+    created,
+    model,
+    choices,
+    usage,
+  };
+}
+
+/** -----------------------------
+ * Route: /chat/completions
+ * ------------------------------
+ */
 app.post(
   "/chat/completions",
   async (req: Request, res: Response, _next: NextFunction) => {
@@ -90,6 +132,7 @@ app.post(
     console.log("📤 Sending sanitized request to Venice:", {
       model: sanitizedBody.model,
       stream: sanitizedBody.stream,
+      messages_count: sanitizedBody.messages.length,
     });
 
     try {
@@ -102,22 +145,34 @@ app.post(
         body: JSON.stringify(sanitizedBody),
       });
 
+      const rawText = await safeReadText(response);
+      // try parse raw JSON if possible
+      let rawData: any = null;
+      try {
+        rawData = JSON.parse(rawText);
+      } catch {
+        rawData = { text: rawText };
+      }
+
+      // Log raw Venice response (useful for debugging — can be verbose)
+      console.debug("⬇️ Raw Venice response:", JSON.stringify(rawData, null, 2));
+
       if (!response.ok) {
-        const text = await safeReadText(response);
-        console.error("⬆️ Upstream non-OK:", response.status, text);
+        console.error("⬆️ Upstream non-OK:", response.status, rawText);
         return res
           .status(response.status)
           .json(
             mapUpstreamErrorToChatMessage({
-              message: text,
+              message: rawText,
               status: response.status,
             })
           );
       }
 
-      const data = await response.json();
-      const clean = sanitizeResponse(data);
-      return res.status(response.status).json(clean);
+      // Sanitize and return a strict OpenAI-style response
+      const clean = sanitizeResponse(rawData);
+      console.debug("🔧 Sanitized response (to client):", JSON.stringify(clean, null, 2));
+      return res.status(200).json(clean);
     } catch (err) {
       console.error("❌ Proxy error:", err);
       if (!res.headersSent) {
@@ -127,8 +182,10 @@ app.post(
   }
 );
 
-/** Helpers */
-
+/** -----------------------------
+ * Helpers
+ * ------------------------------
+ */
 function isJsonRpc(b: any): b is JsonRpcRequest {
   return b && typeof b === "object" && b.jsonrpc === "2.0" && "method" in b;
 }
