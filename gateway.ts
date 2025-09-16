@@ -1,4 +1,4 @@
-// gateway.ts (v3.2)
+// gateway.ts (v3.3)
 require("dotenv").config();
 
 import type { Request, Response, NextFunction } from "express";
@@ -41,54 +41,34 @@ function sanitizeChatBody(b: any): ChatPayload {
   return {
     model: model || process.env.DEFAULT_CHAT_MODEL || "venice-uncensored",
     messages: Array.isArray(messages) ? messages : [],
-    stream: false,
+    stream: false, // force streaming off
   };
 }
 
 /** -----------------------------
- * Response sanitizer
- * Strict OpenAI schema, no nulls
+ * Response sanitizer (minimal OpenAI schema)
  * ------------------------------ */
-function sanitizeChoice(choice: any) {
-  const idx = typeof choice.index === "number" ? choice.index : 0;
-  const finish_reason = choice.finish_reason ?? choice.stop_reason ?? "stop";
-
-  const msg = choice.message ?? choice.delta ?? {};
-  const role = msg.role ?? "assistant";
-  const content =
-    typeof msg.content === "string"
-      ? msg.content
-      : msg.content
-      ? JSON.stringify(msg.content)
-      : "";
-
-  return {
-    index: idx,
-    message: { role, content },
-    finish_reason,
-  };
-}
-
 function sanitizeResponse(data: any) {
   const id = data?.id ?? `chatcmpl-${Date.now()}`;
-  const object = data?.object ?? "chat.completion";
+  const object = "chat.completion";
   const created = data?.created ?? Math.floor(Date.now() / 1000);
   const model =
     data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
 
   const rawChoices = Array.isArray(data?.choices) ? data.choices : [];
-  const choices = rawChoices.map(sanitizeChoice);
-
-  let usage = undefined;
-  if (data?.usage) {
-    usage = {
-      prompt_tokens: data.usage.prompt_tokens ?? 0,
-      completion_tokens: data.usage.completion_tokens ?? 0,
-      total_tokens: data.usage.total_tokens ?? 0,
+  const choices = rawChoices.map((choice: any) => {
+    const msg = choice.message ?? choice.delta ?? {};
+    return {
+      index: typeof choice.index === "number" ? choice.index : 0,
+      message: {
+        role: msg.role ?? "assistant",
+        content: typeof msg.content === "string" ? msg.content : "",
+      },
+      finish_reason: choice.finish_reason ?? choice.stop_reason ?? "stop",
     };
-  }
+  });
 
-  return { id, object, created, model, choices, usage };
+  return { id, object, created, model, choices };
 }
 
 /** -----------------------------
@@ -134,6 +114,10 @@ app.post(
     });
 
     try {
+      // Add timeout so Venice never hangs silently
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000); // 10s
+
       const response = await fetch(VENICE_CHAT_URL, {
         method: "POST",
         headers: {
@@ -141,7 +125,9 @@ app.post(
           "Content-Type": "application/json",
         },
         body: JSON.stringify(sanitizedBody),
+        signal: controller.signal,
       });
+      clearTimeout(timer);
 
       const rawText = await safeReadText(response);
       let rawData: any = {};
