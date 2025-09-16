@@ -25,7 +25,6 @@ type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean }
 
 /**
  * Sanitize request body for Venice API
- * Strips out unsupported OpenAI-style fields (e.g. reasoning_effort, temperature, etc.)
  */
 function sanitizeChatBody(b: any) {
   if (!b || typeof b !== "object") return {};
@@ -36,6 +35,20 @@ function sanitizeChatBody(b: any) {
     model: model || process.env.DEFAULT_CHAT_MODEL || "venice-uncensored",
     messages: Array.isArray(messages) ? messages : [],
     stream: false, // hard disable streaming
+  };
+}
+
+/**
+ * Sanitize Venice response into pure OpenAI format
+ */
+function sanitizeResponse(data: any) {
+  return {
+    id: data.id,
+    object: data.object,
+    created: data.created,
+    model: data.model,
+    choices: data.choices,
+    usage: data.usage,
   };
 }
 
@@ -103,7 +116,8 @@ app.post(
       }
 
       const data = await response.json();
-      return res.status(response.status).json(data);
+      const clean = sanitizeResponse(data);
+      return res.status(response.status).json(clean);
     } catch (err) {
       console.error("❌ Proxy error:", err);
       if (!res.headersSent) {
