@@ -1,4 +1,4 @@
-// gateway.ts (v3)
+// gateway.ts (v3.1)
 require("dotenv").config();
 
 import type { Request, Response, NextFunction } from "express";
@@ -26,10 +26,16 @@ type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean }
 
 /** -----------------------------
  * Request sanitizer (whitelist)
- * ------------------------------
- */
-function sanitizeChatBody(b: any) {
-  if (!b || typeof b !== "object") return {};
+ * Always returns a body with messages[]
+ * ------------------------------ */
+function sanitizeChatBody(b: any): ChatPayload {
+  if (!b || typeof b !== "object") {
+    return {
+      model: process.env.DEFAULT_CHAT_MODEL || "venice-uncensored",
+      messages: [],
+      stream: false,
+    };
+  }
 
   const { model, messages } = b;
 
@@ -43,20 +49,19 @@ function sanitizeChatBody(b: any) {
 /** -----------------------------
  * Response sanitizer (deep)
  * Return a strict OpenAI-style response
- * ------------------------------
- */
+ * ------------------------------ */
 function sanitizeChoice(choice: any) {
   const idx = typeof choice.index === "number" ? choice.index : 0;
   const finish_reason = choice.finish_reason ?? choice.stop_reason ?? "stop";
 
-  // message may be under choice.message or choice.delta for streaming (we expect message)
   const msg = choice.message ?? choice.delta ?? {};
   const role = msg.role ?? "assistant";
   const content =
     typeof msg.content === "string"
       ? msg.content
-      : // sometimes content may be an object/array — stringify safely
-        (msg.content ? JSON.stringify(msg.content) : "");
+      : msg.content
+      ? JSON.stringify(msg.content)
+      : "";
 
   return {
     index: idx,
@@ -69,14 +74,13 @@ function sanitizeChoice(choice: any) {
 }
 
 function sanitizeResponse(data: any) {
-  // defensive defaults
   const id = data?.id ?? `chatcmpl-${Date.now()}`;
   const object = data?.object ?? "chat.completion";
   const created = data?.created ?? Math.floor(Date.now() / 1000);
-  const model = data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
+  const model =
+    data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
   const usage = data?.usage ?? null;
 
-  // ensure choices is an array and deep-clean each choice/message
   const rawChoices = Array.isArray(data?.choices) ? data.choices : [];
   const choices = rawChoices.map(sanitizeChoice);
 
@@ -92,8 +96,7 @@ function sanitizeResponse(data: any) {
 
 /** -----------------------------
  * Route: /chat/completions
- * ------------------------------
- */
+ * ------------------------------ */
 app.post(
   "/chat/completions",
   async (req: Request, res: Response, _next: NextFunction) => {
@@ -146,7 +149,6 @@ app.post(
       });
 
       const rawText = await safeReadText(response);
-      // try parse raw JSON if possible
       let rawData: any = null;
       try {
         rawData = JSON.parse(rawText);
@@ -154,7 +156,6 @@ app.post(
         rawData = { text: rawText };
       }
 
-      // Log raw Venice response (useful for debugging — can be verbose)
       console.debug("⬇️ Raw Venice response:", JSON.stringify(rawData, null, 2));
 
       if (!response.ok) {
@@ -169,9 +170,11 @@ app.post(
           );
       }
 
-      // Sanitize and return a strict OpenAI-style response
       const clean = sanitizeResponse(rawData);
-      console.debug("🔧 Sanitized response (to client):", JSON.stringify(clean, null, 2));
+      console.debug(
+        "🔧 Sanitized response (to client):",
+        JSON.stringify(clean, null, 2)
+      );
       return res.status(200).json(clean);
     } catch (err) {
       console.error("❌ Proxy error:", err);
@@ -184,8 +187,7 @@ app.post(
 
 /** -----------------------------
  * Helpers
- * ------------------------------
- */
+ * ------------------------------ */
 function isJsonRpc(b: any): b is JsonRpcRequest {
   return b && typeof b === "object" && b.jsonrpc === "2.0" && "method" in b;
 }
