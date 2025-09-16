@@ -1,4 +1,4 @@
-// gateway.ts (v3.1)
+// gateway.ts (v3.2)
 require("dotenv").config();
 
 import type { Request, Response, NextFunction } from "express";
@@ -25,8 +25,7 @@ type ChatMessage = {
 type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean };
 
 /** -----------------------------
- * Request sanitizer (whitelist)
- * Always returns a body with messages[]
+ * Request sanitizer (always define messages[])
  * ------------------------------ */
 function sanitizeChatBody(b: any): ChatPayload {
   if (!b || typeof b !== "object") {
@@ -42,13 +41,13 @@ function sanitizeChatBody(b: any): ChatPayload {
   return {
     model: model || process.env.DEFAULT_CHAT_MODEL || "venice-uncensored",
     messages: Array.isArray(messages) ? messages : [],
-    stream: false, // hard disable streaming
+    stream: false,
   };
 }
 
 /** -----------------------------
- * Response sanitizer (deep)
- * Return a strict OpenAI-style response
+ * Response sanitizer
+ * Strict OpenAI schema, no nulls
  * ------------------------------ */
 function sanitizeChoice(choice: any) {
   const idx = typeof choice.index === "number" ? choice.index : 0;
@@ -65,10 +64,7 @@ function sanitizeChoice(choice: any) {
 
   return {
     index: idx,
-    message: {
-      role,
-      content,
-    },
+    message: { role, content },
     finish_reason,
   };
 }
@@ -79,23 +75,24 @@ function sanitizeResponse(data: any) {
   const created = data?.created ?? Math.floor(Date.now() / 1000);
   const model =
     data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
-  const usage = data?.usage ?? null;
 
   const rawChoices = Array.isArray(data?.choices) ? data.choices : [];
   const choices = rawChoices.map(sanitizeChoice);
 
-  return {
-    id,
-    object,
-    created,
-    model,
-    choices,
-    usage,
-  };
+  let usage = undefined;
+  if (data?.usage) {
+    usage = {
+      prompt_tokens: data.usage.prompt_tokens ?? 0,
+      completion_tokens: data.usage.completion_tokens ?? 0,
+      total_tokens: data.usage.total_tokens ?? 0,
+    };
+  }
+
+  return { id, object, created, model, choices, usage };
 }
 
 /** -----------------------------
- * Route: /chat/completions
+ * Route
  * ------------------------------ */
 app.post(
   "/chat/completions",
@@ -111,25 +108,23 @@ app.post(
         .json({ error: "Access denied. Unauthorized client." });
     }
 
-    // Block MCP/JSON-RPC on chat route
+    // Block JSON-RPC
     if (isJsonRpc(body)) {
       console.log("🛑 JSON-RPC (MCP) request received — rejecting");
-      console.log("📦 Rejected Payload:", JSON.stringify(body, null, 2));
-      console.log("📡 Headers:", JSON.stringify(req.headers, null, 2));
       return res.status(400).json({
         error:
           "JSON-RPC (MCP) request cannot be sent to chat endpoint. Route it to an MCP handler.",
       });
     }
 
-    // Validate chat payload
+    // Validate payload
     if (!isChatPayload(body)) {
       return res.status(400).json({
         error: "Invalid chat request. 'messages' array is required.",
       });
     }
 
-    // Sanitize body before forwarding
+    // Sanitize body
     const sanitizedBody = sanitizeChatBody(body);
 
     console.log("📤 Sending sanitized request to Venice:", {
@@ -149,14 +144,12 @@ app.post(
       });
 
       const rawText = await safeReadText(response);
-      let rawData: any = null;
+      let rawData: any = {};
       try {
         rawData = JSON.parse(rawText);
       } catch {
         rawData = { text: rawText };
       }
-
-      console.debug("⬇️ Raw Venice response:", JSON.stringify(rawData, null, 2));
 
       if (!response.ok) {
         console.error("⬆️ Upstream non-OK:", response.status, rawText);
@@ -171,10 +164,7 @@ app.post(
       }
 
       const clean = sanitizeResponse(rawData);
-      console.debug(
-        "🔧 Sanitized response (to client):",
-        JSON.stringify(clean, null, 2)
-      );
+      console.debug("🔧 Sanitized response:", JSON.stringify(clean, null, 2));
       return res.status(200).json(clean);
     } catch (err) {
       console.error("❌ Proxy error:", err);
