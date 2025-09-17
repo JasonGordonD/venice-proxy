@@ -1,32 +1,44 @@
-// gateway.ts (v3.3)
+// gateway.ts (v3.3+) – Venice Proxy Gateway for ElevenLabs
+
 require("dotenv").config();
 
 import type { Request, Response, NextFunction } from "express";
-const express = require("express");
-const fetch = require("node-fetch");
+import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json());
 
+// Allow larger payloads (fixes PayloadTooLargeError)
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// Constants
 const VENICE_CHAT_URL =
-  process.env.VENICE_CHAT_URL ||
-  "https://api.venice.ai/api/v1/chat/completions";
+  process.env.VENICE_CHAT_URL || "https://api.venice.ai/api/v1/chat/completions";
 
+const PORT = process.env.PORT || 10000;
+
+// Types
 type JsonRpcRequest = {
   jsonrpc: string;
   method: string;
   params?: unknown;
   id?: string | number | null;
 };
+
 type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
   content: unknown;
 };
-type ChatPayload = { model?: string; messages: ChatMessage[]; stream?: boolean };
 
-/** -----------------------------
- * Request sanitizer (always define messages[])
- * ------------------------------ */
+type ChatPayload = {
+  model?: string;
+  messages: ChatMessage[];
+  stream?: boolean;
+};
+
+// --- Body & Response Sanitizers ---
+
 function sanitizeChatBody(b: any): ChatPayload {
   if (!b || typeof b !== "object") {
     return {
@@ -41,19 +53,15 @@ function sanitizeChatBody(b: any): ChatPayload {
   return {
     model: model || process.env.DEFAULT_CHAT_MODEL || "venice-uncensored",
     messages: Array.isArray(messages) ? messages : [],
-    stream: false, // force streaming off
+    stream: false, // streaming disabled for safety
   };
 }
 
-/** -----------------------------
- * Response sanitizer (minimal OpenAI schema)
- * ------------------------------ */
 function sanitizeResponse(data: any) {
   const id = data?.id ?? `chatcmpl-${Date.now()}`;
   const object = "chat.completion";
   const created = data?.created ?? Math.floor(Date.now() / 1000);
-  const model =
-    data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
+  const model = data?.model ?? process.env.DEFAULT_CHAT_MODEL ?? "venice-uncensored";
 
   const rawChoices = Array.isArray(data?.choices) ? data.choices : [];
   const choices = rawChoices.map((choice: any) => {
@@ -71,99 +79,85 @@ function sanitizeResponse(data: any) {
   return { id, object, created, model, choices };
 }
 
-/** -----------------------------
- * Route
- * ------------------------------ */
-app.post(
-  "/chat/completions",
-  async (req: Request, res: Response, _next: NextFunction) => {
-    const body = req.body;
+// --- Main Chat Proxy Route ---
 
-    // Restrict access to ElevenLabs only
-    const clientHeader = req.headers["x-client"];
-    if (clientHeader !== "elevenlabs") {
-      console.warn("🚫 Unauthorized client attempted access:", clientHeader);
-      return res
-        .status(403)
-        .json({ error: "Access denied. Unauthorized client." });
-    }
+app.post("/chat/completions", async (req: Request, res: Response) => {
+  const body = req.body;
 
-    // Block JSON-RPC
-    if (isJsonRpc(body)) {
-      console.log("🛑 JSON-RPC (MCP) request received — rejecting");
-      return res.status(400).json({
-        error:
-          "JSON-RPC (MCP) request cannot be sent to chat endpoint. Route it to an MCP handler.",
-      });
-    }
+  // Allowlist check
+  const clientHeader = req.headers["x-client"];
+  if (clientHeader !== "elevenlabs") {
+    console.warn("🚫 Unauthorized client:", clientHeader);
+    return res.status(403).json({ error: "Access denied. Unauthorized client." });
+  }
 
-    // Validate payload
-    if (!isChatPayload(body)) {
-      return res.status(400).json({
-        error: "Invalid chat request. 'messages' array is required.",
-      });
-    }
+  // Reject JSON-RPC payloads
+  if (isJsonRpc(body)) {
+    return res.status(400).json({
+      error: "JSON-RPC (MCP) requests are not allowed here. Route to the MCP handler.",
+    });
+  }
 
-    // Sanitize body
-    const sanitizedBody = sanitizeChatBody(body);
+  // Validate chat structure
+  if (!isChatPayload(body)) {
+    return res.status(400).json({
+      error: "Invalid chat request. 'messages' array is required.",
+    });
+  }
 
-    console.log("📤 Sending sanitized request to Venice:", {
-      model: sanitizedBody.model,
-      stream: sanitizedBody.stream,
-      messages_count: sanitizedBody.messages.length,
+  const sanitizedBody = sanitizeChatBody(body);
+
+  console.log("📤 Proxying to Venice:", {
+    model: sanitizedBody.model,
+    messages_count: sanitizedBody.messages.length,
+    stream: sanitizedBody.stream,
+  });
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+    const response = await fetch(VENICE_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.VENICE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(sanitizedBody),
+      signal: controller.signal,
     });
 
+    clearTimeout(timeout);
+
+    const rawText = await safeReadText(response);
+    let parsedData: any = {};
+
     try {
-      // Add timeout so Venice never hangs silently
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10000); // 10s
+      parsedData = JSON.parse(rawText);
+    } catch {
+      parsedData = { text: rawText };
+    }
 
-      const response = await fetch(VENICE_CHAT_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.VENICE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(sanitizedBody),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
+    if (!response.ok) {
+      console.error("⬆️ Upstream error:", response.status, rawText);
+      return res
+        .status(response.status)
+        .json(mapUpstreamErrorToChatMessage({ message: rawText, status: response.status }));
+    }
 
-      const rawText = await safeReadText(response);
-      let rawData: any = {};
-      try {
-        rawData = JSON.parse(rawText);
-      } catch {
-        rawData = { text: rawText };
-      }
-
-      if (!response.ok) {
-        console.error("⬆️ Upstream non-OK:", response.status, rawText);
-        return res
-          .status(response.status)
-          .json(
-            mapUpstreamErrorToChatMessage({
-              message: rawText,
-              status: response.status,
-            })
-          );
-      }
-
-      const clean = sanitizeResponse(rawData);
-      console.debug("🔧 Sanitized response:", JSON.stringify(clean, null, 2));
-      return res.status(200).json(clean);
-    } catch (err) {
-      console.error("❌ Proxy error:", err);
-      if (!res.headersSent) {
-        return res.status(502).json(mapUpstreamErrorToChatMessage(err));
-      }
+    const clean = sanitizeResponse(parsedData);
+    console.debug("✅ Sanitized response:", JSON.stringify(clean, null, 2));
+    return res.status(200).json(clean);
+  } catch (err) {
+    console.error("❌ Proxy error:", err);
+    if (!res.headersSent) {
+      return res.status(502).json(mapUpstreamErrorToChatMessage(err));
     }
   }
-);
+});
 
-/** -----------------------------
- * Helpers
- * ------------------------------ */
+// --- Helpers ---
+
 function isJsonRpc(b: any): b is JsonRpcRequest {
   return b && typeof b === "object" && b.jsonrpc === "2.0" && "method" in b;
 }
@@ -200,7 +194,23 @@ async function safeReadText(response: any): Promise<string> {
   }
 }
 
-const PORT = process.env.PORT || 10000;
+// --- Optional Global Error Handler ---
+
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({
+      error: "Payload too large",
+      message: "Request exceeds size limit. Please reduce payload size.",
+    });
+  }
+  return res.status(500).json({
+    error: "Internal server error",
+    message: err.message || "Unexpected error occurred.",
+  });
+});
+
+// --- Server Start ---
+
 app.listen(PORT, () => {
-  console.log(`🚀 Proxy server running on port ${PORT}`);
+  console.log(`🚀 Venice Proxy running on port ${PORT}`);
 });
