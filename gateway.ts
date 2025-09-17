@@ -1,4 +1,4 @@
-// gateway.ts – Venice Proxy for ElevenLabs (Node 18+ Ready)
+// gateway.ts – Venice Proxy for ElevenLabs (AbortError-safe, 20s timeout)
 
 require("dotenv").config();
 
@@ -7,7 +7,7 @@ import express from "express";
 
 const app = express();
 
-// Allow large JSON body sizes (fixes PayloadTooLargeError)
+// Allow large payloads (10mb limit)
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
@@ -32,7 +32,8 @@ type ChatPayload = {
   stream?: boolean;
 };
 
-/** Sanitize incoming chat body */
+// --- Body & Response Sanitizers ---
+
 function sanitizeChatBody(b: any): ChatPayload {
   if (!b || typeof b !== "object") {
     return {
@@ -51,7 +52,6 @@ function sanitizeChatBody(b: any): ChatPayload {
   };
 }
 
-/** Clean up response before sending to client */
 function sanitizeResponse(data: any) {
   const id = data?.id ?? `chatcmpl-${Date.now()}`;
   const object = "chat.completion";
@@ -74,25 +74,23 @@ function sanitizeResponse(data: any) {
   return { id, object, created, model, choices };
 }
 
-/** Main endpoint */
+// --- Main Route ---
+
 app.post("/chat/completions", async (req: Request, res: Response) => {
   const body = req.body;
 
-  // Restrict to ElevenLabs
   const clientHeader = req.headers["x-client"];
   if (clientHeader !== "elevenlabs") {
     console.warn("🚫 Unauthorized client:", clientHeader);
     return res.status(403).json({ error: "Access denied. Unauthorized client." });
   }
 
-  // Block JSON-RPC requests
   if (isJsonRpc(body)) {
     return res.status(400).json({
       error: "JSON-RPC (MCP) request cannot be sent to chat endpoint.",
     });
   }
 
-  // Validate
   if (!isChatPayload(body)) {
     return res.status(400).json({
       error: "Invalid chat request. 'messages' array is required.",
@@ -109,7 +107,7 @@ app.post("/chat/completions", async (req: Request, res: Response) => {
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10 sec timeout
+    const timeout = setTimeout(() => controller.abort(), 20000); // 20s timeout
 
     const response = await fetch(VENICE_CHAT_URL, {
       method: "POST",
@@ -124,12 +122,12 @@ app.post("/chat/completions", async (req: Request, res: Response) => {
     clearTimeout(timeout);
 
     const rawText = await safeReadText(response);
-    let rawData: any = {};
+    let parsedData: any = {};
 
     try {
-      rawData = JSON.parse(rawText);
+      parsedData = JSON.parse(rawText);
     } catch {
-      rawData = { text: rawText };
+      parsedData = { text: rawText };
     }
 
     if (!response.ok) {
@@ -139,10 +137,20 @@ app.post("/chat/completions", async (req: Request, res: Response) => {
         .json(mapUpstreamErrorToChatMessage({ message: rawText, status: response.status }));
     }
 
-    const clean = sanitizeResponse(rawData);
+    const clean = sanitizeResponse(parsedData);
     console.debug("✅ Clean response:", JSON.stringify(clean, null, 2));
     return res.status(200).json(clean);
-  } catch (err) {
+  } catch (err: any) {
+    clearTimeout(timeout);
+
+    if (err.name === "AbortError") {
+      console.warn("⚠️ Venice API timeout after 20s");
+      return res.status(504).json({
+        error: "Timeout",
+        message: "Venice API did not respond in time",
+      });
+    }
+
     console.error("❌ Proxy error:", err);
     if (!res.headersSent) {
       return res.status(502).json(mapUpstreamErrorToChatMessage(err));
@@ -150,7 +158,8 @@ app.post("/chat/completions", async (req: Request, res: Response) => {
   }
 });
 
-/** Helper Functions */
+// --- Helpers ---
+
 function isJsonRpc(b: any): b is JsonRpcRequest {
   return b && typeof b === "object" && b.jsonrpc === "2.0" && "method" in b;
 }
@@ -187,21 +196,24 @@ async function safeReadText(response: any): Promise<string> {
   }
 }
 
-/** Optional: Handle 413 errors gracefully */
+// --- Optional Error Handler ---
+
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   if (err.type === "entity.too.large") {
     return res.status(413).json({
       error: "Payload too large",
-      message: "Request exceeds size limit. Try reducing input.",
+      message: "Request exceeds limit. Try reducing input size.",
     });
   }
+
   return res.status(500).json({
     error: "Internal server error",
     message: err.message || "Unexpected failure.",
   });
 });
 
-/** Start server */
+// --- Server Start ---
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Venice Proxy is live on port ${PORT}`);
